@@ -24,6 +24,11 @@ Camera photo (every ~500 ms)
 - An iPhone
 - **A development build** — OCR uses ML Kit, a native module that does **not** run inside Expo Go. Everything else (camera, crop box, audio) works in Expo Go; OCR will show as "UNAVAILABLE" in the debug panel there.
 
+> The project is pinned to **Expo SDK 54** on purpose: it's the newest SDK the
+> iOS App Store version of Expo Go can run (newer Expo Go releases are stuck in
+> Apple review — see Expo's May 2026 changelog). Don't upgrade the SDK if you
+> still want Expo Go previews to work.
+
 ## Run it
 
 ```bash

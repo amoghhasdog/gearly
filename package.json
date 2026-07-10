@@ -5,19 +5,19 @@
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-ml-kit/text-recognition": "^2.0.0",
-    "expo": "~57.0.4",
-    "expo-audio": "~57.0.0",
-    "expo-camera": "~57.0.1",
-    "expo-dev-client": "~57.0.5",
-    "expo-image-manipulator": "~57.0.2",
-    "expo-status-bar": "~57.0.0",
-    "react": "19.2.3",
-    "react-native": "0.86.0",
-    "react-native-safe-area-context": "~5.7.0"
+    "expo": "^54.0.35",
+    "expo-audio": "~1.1.1",
+    "expo-camera": "~17.0.10",
+    "expo-dev-client": "~6.0.21",
+    "expo-image-manipulator": "~14.0.8",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-safe-area-context": "~5.6.0"
   },
   "devDependencies": {
-    "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
+    "@types/react": "~19.1.10",
+    "typescript": "~5.9.2"
   },
   "scripts": {
     "start": "expo start",
