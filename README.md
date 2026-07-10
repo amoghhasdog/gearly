@@ -48,6 +48,20 @@ npx expo start
 
 `npm run typecheck` runs the TypeScript compiler.
 
+## Replay harness (offline testing)
+
+`scripts/replay.ts` replays recorded OCR readings through the real
+`SpeedFilter` + `EngineSimulator` — no phone needed:
+
+```bash
+npx tsx scripts/replay.ts <ocr_readings.jsonl> <out_trace.json>
+```
+
+Input is one JSON object per line: `{"clip","frame","t","text"}` where `text`
+is raw OCR output for that frame. The filter's anti-garbage rules (jump
+confirmation, anchor confirmation, zero confirmation, dropout decay) were
+tuned with this harness against ~7 minutes of real Tesla screen footage.
+
 ## Setup in the car
 
 1. **Bluetooth:** pair your iPhone with the Tesla (Controls → Bluetooth on the car). Select your phone as the audio source. Any audio the app plays now comes out of the car speakers.

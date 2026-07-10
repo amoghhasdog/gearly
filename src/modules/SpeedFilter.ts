@@ -21,6 +21,16 @@ export interface SpeedFilterConfig {
   jumpMarginMph: number;
   /** Consecutive similar readings needed to accept a large jump. */
   jumpConfirmFrames: number;
+  /**
+   * If a reading consistent with the current speed was accepted within this
+   * window, a pending jump needs extra confirmations. A real speed change
+   * moves through intermediate values; a "teleport" contradicted by fresh
+   * consistent readings is almost always a repeated misread (e.g. a stray
+   * glyph OCR'd as "4" every few frames while cruising at 28).
+   */
+  recentConsistentWindowMs: number;
+  /** Extra confirmations required inside that window. */
+  jumpExtraConfirmations: number;
   /** How close (mph) repeat readings must be to count as confirming a jump. */
   jumpMatchToleranceMph: number;
   /** Consecutive zero readings needed to accept 0 while moving. */
@@ -41,6 +51,8 @@ const DEFAULT_CONFIG: SpeedFilterConfig = {
   maxAccelMphPerSec: 12,
   jumpMarginMph: 3,
   jumpConfirmFrames: 3,
+  recentConsistentWindowMs: 2000,
+  jumpExtraConfirmations: 2,
   jumpMatchToleranceMph: 8,
   zeroConfirmFrames: 3,
   staleAfterMs: 2500,
@@ -62,7 +74,16 @@ export class SpeedFilter {
 
   /** Pending large jump waiting for multi-frame confirmation. */
   private pendingJump: { valueMph: number; count: number } | null = null;
+  /**
+   * First-ever reading waiting for confirmation. A single misread as the very
+   * first sample would otherwise anchor the filter to a bogus speed and make
+   * it reject every real reading after it (seen in real footage: an initial
+   * "90" misread at ~11 mph poisoned 15 s of readings).
+   */
+  private pendingAnchor: { valueMph: number; count: number } | null = null;
   private zeroStreak = 0;
+  /** Timestamp of the last accepted reading that agreed with the filtered speed. */
+  private lastConsistentAcceptTs: number | null = null;
 
   constructor(config?: Partial<SpeedFilterConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -75,22 +96,39 @@ export class SpeedFilter {
     this.rejectedCount = 0;
     this.lastRejectionReason = null;
     this.pendingJump = null;
+    this.pendingAnchor = null;
     this.zeroStreak = 0;
+    this.lastConsistentAcceptTs = null;
   }
 
   /** Feed one OCR reading (in the unit shown on the Tesla screen). */
   update(reading: SpeedReading, unit: SpeedUnit, now: number = Date.now()): FilterSnapshot {
-    if (reading.status === 'no_text') {
-      return this.reject('no text', now);
-    }
-    if (reading.status === 'invalid' || reading.parsedSpeed == null) {
-      return this.reject('non-numeric OCR result', now);
+    if (reading.status === 'no_text' || reading.status === 'invalid' || reading.parsedSpeed == null) {
+      // A dropout breaks any jump-confirmation streak: sporadic identical
+      // garbage (e.g. a stray glyph misread as "4" every few seconds) must not
+      // accumulate confirmations across gaps and hijack the speed. Real hard
+      // braking produces *consecutive* readings, which still confirm fine.
+      this.pendingJump = null;
+      return this.reject(reading.status === 'no_text' ? 'no text' : 'non-numeric OCR result', now);
     }
 
     const mph = normalizeToMph(reading.parsedSpeed, unit);
 
     if (mph < 0 || mph > this.config.maxSpeedMph) {
       return this.reject(`out of range (${Math.round(mph)} mph)`, now);
+    }
+
+    // --- First-ever reading: require two consecutive readings that roughly
+    // agree before anchoring the filter. ---
+    if (this.lastValidSpeedMph == null) {
+      if (
+        this.pendingAnchor &&
+        Math.abs(mph - this.pendingAnchor.valueMph) <= this.config.jumpMatchToleranceMph
+      ) {
+        return this.accept(mph, reading.confidence, now);
+      }
+      this.pendingAnchor = { valueMph: mph, count: 1 };
+      return this.reject(`initial reading ${mph.toFixed(0)} mph awaiting confirmation`, now);
     }
 
     // --- Zero handling: a hard drop to 0 needs repeated confirmation, so a
@@ -107,7 +145,7 @@ export class SpeedFilter {
     this.zeroStreak = 0;
 
     // --- Unrealistic jump rejection with multi-frame confirmation. ---
-    if (this.lastValidSpeedMph != null && this.lastValidTimestamp != null) {
+    if (this.lastValidTimestamp != null) {
       const dtSec = Math.max(0.1, (now - this.lastValidTimestamp) / 1000);
       const maxDelta = this.config.maxAccelMphPerSec * dtSec + this.config.jumpMarginMph;
       const delta = Math.abs(mph - this.lastValidSpeedMph);
@@ -123,23 +161,39 @@ export class SpeedFilter {
           this.pendingJump = { valueMph: mph, count: 1 };
         }
 
-        if (this.pendingJump.count < this.config.jumpConfirmFrames) {
+        // A teleport contradicted by recent consistent readings is held to a
+        // higher standard than one following a blind stretch.
+        const contradicted =
+          this.lastConsistentAcceptTs != null &&
+          now - this.lastConsistentAcceptTs < this.config.recentConsistentWindowMs;
+        const required =
+          this.config.jumpConfirmFrames + (contradicted ? this.config.jumpExtraConfirmations : 0);
+
+        if (this.pendingJump.count < required) {
           return this.reject(
             `unrealistic jump ${this.lastValidSpeedMph.toFixed(0)}→${mph.toFixed(0)} mph ` +
-              `(${this.pendingJump.count}/${this.config.jumpConfirmFrames} confirmations)`,
+              `(${this.pendingJump.count}/${required} confirmations)`,
             now
           );
         }
-        // Same "impossible" value seen repeatedly — trust it (OCR was right, our
-        // previous state was wrong, e.g. after a missed stretch of readings).
+        // Same "impossible" value seen repeatedly — trust it: OCR is right and
+        // our previous state was wrong (bad anchor, missed stretch, ...).
+        // Snap straight there instead of EMA-gliding from the wrong value.
+        return this.accept(mph, reading.confidence, now, true);
       }
     }
 
     return this.accept(mph, reading.confidence, now);
   }
 
-  private accept(mph: number, confidence: number | undefined, now: number): FilterSnapshot {
+  private accept(
+    mph: number,
+    confidence: number | undefined,
+    now: number,
+    snap = false
+  ): FilterSnapshot {
     this.pendingJump = null;
+    this.pendingAnchor = null;
     if (mph === 0) this.zeroStreak = 0;
 
     const alpha =
@@ -150,7 +204,10 @@ export class SpeedFilter {
           : this.config.alphaLowConfidence;
 
     this.filteredSpeedMph =
-      this.filteredSpeedMph == null ? mph : alpha * mph + (1 - alpha) * this.filteredSpeedMph;
+      this.filteredSpeedMph == null || snap
+        ? mph
+        : alpha * mph + (1 - alpha) * this.filteredSpeedMph;
+    this.lastConsistentAcceptTs = now;
     this.lastValidSpeedMph = mph;
     this.lastValidTimestamp = now;
     this.lastRejectionReason = null;
