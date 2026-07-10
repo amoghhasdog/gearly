@@ -5,7 +5,9 @@ import { ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-nati
 import { SafeAreaView } from 'react-native-safe-area-context';
 import CameraPreviewWithCropBox from '../components/CameraPreviewWithCropBox';
 import DebugPanel from '../components/DebugPanel';
+import DebugSpeedControls from '../components/DebugSpeedControls';
 import EngineDashboard from '../components/EngineDashboard';
+import { sampleDriveSpeedAt } from '../debug/sampleDrive';
 import { EngineAudio } from '../modules/EngineAudio';
 import { EngineSimulator } from '../modules/EngineSimulator';
 import { SpeedFilter } from '../modules/SpeedFilter';
@@ -45,6 +47,12 @@ export default function MainScreen() {
   const [engineState, setEngineState] = useState<EngineState | null>(null);
   const [audioInfo, setAudioInfo] = useState<AudioInfo>(EngineAudio.getInfo());
 
+  // Debug speed simulation: manual slider or replay of a recorded drive.
+  // When active, it replaces the camera as the simulator's speed source.
+  const [simEnabled, setSimEnabled] = useState(false);
+  const [simSpeedMph, setSimSpeedMph] = useState(0);
+  const [isReplaying, setIsReplaying] = useState(false);
+
   // Long-lived logic modules (never recreated on re-render).
   const speedReader = useRef(new SpeedReader()).current;
   const speedFilter = useRef(new SpeedFilter()).current;
@@ -59,6 +67,10 @@ export default function MainScreen() {
   previewSizeRef.current = previewSize;
   const audioRunningRef = useRef(false);
   audioRunningRef.current = audioInfo.isRunning;
+  const simActiveRef = useRef(false);
+  simActiveRef.current = simEnabled || isReplaying;
+  const simSpeedRef = useRef(0);
+  simSpeedRef.current = simSpeedMph;
 
   // --- Persist calibration so the user doesn't recalibrate every drive. ---
   useEffect(() => {
@@ -143,12 +155,14 @@ export default function MainScreen() {
     };
   }, [isReading, cameraReady, speedFilter, speedReader]);
 
-  // --- Engine loop: filtered speed → simulator → audio, every 250 ms. ---
+  // --- Engine loop: speed (camera or simulated) → simulator → audio, every 250 ms. ---
   useEffect(() => {
-    if (!isReading && !audioInfo.isRunning) return;
+    if (!isReading && !audioInfo.isRunning && !simEnabled && !isReplaying) return;
     const id = setInterval(() => {
       const now = Date.now();
-      const { speedMph } = speedFilter.getCurrentSpeed(now);
+      const speedMph = simActiveRef.current
+        ? simSpeedRef.current
+        : speedFilter.getCurrentSpeed(now).speedMph;
       const state = simulator.update({ speed: speedMph, unit: 'mph', timestamp: now });
       setEngineState(state);
       setFilterSnap(speedFilter.getSnapshot(now)); // keeps the stale flag live during OCR gaps
@@ -157,7 +171,23 @@ export default function MainScreen() {
       }
     }, ENGINE_TICK_MS);
     return () => clearInterval(id);
-  }, [isReading, audioInfo.isRunning, simulator, speedFilter]);
+  }, [isReading, audioInfo.isRunning, simEnabled, isReplaying, simulator, speedFilter]);
+
+  // --- Recorded-drive replay: step the simulated speed through a real trace. ---
+  useEffect(() => {
+    if (!isReplaying) return;
+    const startedAt = Date.now();
+    const id = setInterval(() => {
+      const mph = sampleDriveSpeedAt(Date.now() - startedAt);
+      if (mph == null) {
+        setIsReplaying(false);
+        setSimSpeedMph(0);
+      } else {
+        setSimSpeedMph(mph);
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [isReplaying]);
 
   const handleStartEngine = useCallback(async () => {
     const info = await EngineAudio.start();
@@ -226,12 +256,32 @@ export default function MainScreen() {
 
         <EngineDashboard
           unit={unit}
-          filteredSpeedMph={filterSnap?.filteredSpeedMph ?? null}
-          isStale={filterSnap?.isStale ?? true}
+          filteredSpeedMph={
+            simEnabled || isReplaying ? simSpeedMph : (filterSnap?.filteredSpeedMph ?? null)
+          }
+          isStale={simEnabled || isReplaying ? false : (filterSnap?.isStale ?? true)}
           engineState={engineState}
           audioInfo={audioInfo}
           onStartEngine={handleStartEngine}
           onStopEngine={handleStopEngine}
+        />
+
+        <DebugSpeedControls
+          unit={unit}
+          simEnabled={simEnabled}
+          simSpeedMph={simSpeedMph}
+          isReplaying={isReplaying}
+          onSimEnabledChange={(enabled) => {
+            setSimEnabled(enabled);
+            if (!enabled) setSimSpeedMph(0);
+          }}
+          onSimSpeedChange={setSimSpeedMph}
+          onToggleReplay={() => {
+            setIsReplaying((r) => {
+              if (r) setSimSpeedMph(0);
+              return !r;
+            });
+          }}
         />
 
         <DebugPanel
