@@ -76,7 +76,8 @@ tuned with this harness against ~7 minutes of real Tesla screen footage.
 | File | Role |
 |---|---|
 | `idle.wav` | seamless idle loop (played near 0 mph) |
-| `engine_loop.wav` | seamless engine loop; playback rate follows virtual RPM |
+| `engine_low.wav` | low-RPM engine layer (~2200 RPM); rate follows virtual RPM |
+| `engine_high.wav` | high-RPM engine layer (~5200 RPM); crossfaded in above ~2800 RPM |
 | `shift.wav` | one-shot on fake gear upshift |
 | `decel.wav` | one-shot on deceleration |
 

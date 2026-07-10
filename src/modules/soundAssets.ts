@@ -8,7 +8,8 @@
  */
 export const SOUND_ASSETS = {
   idle: require('../../assets/sounds/idle.wav'),
-  engine_loop: require('../../assets/sounds/engine_loop.wav'),
+  engine_low: require('../../assets/sounds/engine_low.wav'),
+  engine_high: require('../../assets/sounds/engine_high.wav'),
   shift: require('../../assets/sounds/shift.wav'),
   decel: require('../../assets/sounds/decel.wav'),
 } as const;

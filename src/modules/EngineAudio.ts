@@ -7,27 +7,52 @@ import { SOUND_ASSETS, SoundName } from './soundAssets';
  * With the phone paired to the Tesla over Bluetooth, iOS routes this straight
  * to the car speakers.
  *
- * MVP approach: two seamless loops (idle + engine) crossfaded by speed, with
- * playback *rate* changes standing in for pitch (pitch correction disabled on
- * purpose — a faster loop should sound higher, like a revving engine), plus
- * one-shot shift and decel samples.
+ * Architecture (the racing-game approach, scaled down):
+ *  - THREE seamless loops: idle, engine_low (≙ ~2200 RPM) and engine_high
+ *    (≙ ~5200 RPM). Each is rate-shifted toward the current virtual RPM and
+ *    the layers are equal-power crossfaded, so no single sample is stretched
+ *    across the whole RPM range.
+ *  - The simulator pushes a *target* state ~4x/s; an internal 15 Hz smoothing
+ *    loop eases actual volume/rate toward the target every ~66 ms. This kills
+ *    the audible stair-stepping that direct 4 Hz jumps produce.
+ *  - One-shot shift/decel samples on top.
  *
  * Every native call is wrapped so a missing/corrupt sound file degrades the
  * audio status instead of crashing the app.
  */
 
-/** Speed range over which idle crossfades into the engine loop. */
+/** Speed range over which idle crossfades into the engine layers. */
 const CROSSFADE_MAX_MPH = 8;
+/** Virtual RPM each engine layer was "recorded" at. */
+const LOW_LAYER_RPM = 2200;
+const HIGH_LAYER_RPM = 5200;
+/** RPM band over which low crossfades into high. */
+const LAYER_FADE_START = 2800;
+const LAYER_FADE_END = 4600;
+/** Smoothing loop cadence and easing factors (fraction of gap closed per tick). */
+const SMOOTH_TICK_MS = 66;
+const VOLUME_EASE = 0.35;
+const RATE_EASE = 0.22;
 /** Minimum gap between decel one-shots so braking doesn't machine-gun the sample. */
 const DECEL_COOLDOWN_MS = 1500;
 
+interface LoopChannel {
+  player: AudioPlayer;
+  volume: number;
+  targetVolume: number;
+  rate: number;
+  targetRate: number;
+}
+
 class EngineAudioController {
-  private players: Partial<Record<SoundName, AudioPlayer>> = {};
+  private loops: Partial<Record<'idle' | 'engine_low' | 'engine_high', LoopChannel>> = {};
+  private oneShots: Partial<Record<'shift' | 'decel', AudioPlayer>> = {};
   private status: AudioStatus = 'uninitialized';
   private missingSounds: string[] = [];
   private lastError: string | null = null;
   private running = false;
   private lastDecelAt = 0;
+  private smoother: ReturnType<typeof setInterval> | null = null;
 
   getInfo(): AudioInfo {
     return {
@@ -56,27 +81,37 @@ class EngineAudioController {
       this.lastError = `audio mode: ${message(e)}`;
     }
 
-    for (const name of Object.keys(SOUND_ASSETS) as SoundName[]) {
+    const loopNames = ['idle', 'engine_low', 'engine_high'] as const;
+    for (const name of loopNames) {
       try {
         const player = createAudioPlayer(SOUND_ASSETS[name]);
-        if (name === 'idle' || name === 'engine_loop') {
-          player.loop = true;
-          try {
-            // We WANT pitch to follow playback rate — that's the whole effect.
-            player.shouldCorrectPitch = false;
-          } catch {
-            // property not supported on some platforms; rate change still works
-          }
+        player.loop = true;
+        try {
+          // We WANT pitch to follow playback rate — that's the whole effect.
+          player.shouldCorrectPitch = false;
+        } catch {
+          // property not supported on some platforms; rate change still works
         }
         player.volume = 0;
-        this.players[name] = player;
+        this.loops[name] = { player, volume: 0, targetVolume: 0, rate: 1, targetRate: 1 };
       } catch (e) {
         this.missingSounds.push(name);
         this.lastError = `${name}: ${message(e)}`;
       }
     }
 
-    if (!this.players.engine_loop && !this.players.idle) {
+    for (const name of ['shift', 'decel'] as const) {
+      try {
+        const player = createAudioPlayer(SOUND_ASSETS[name]);
+        player.volume = 0;
+        this.oneShots[name] = player;
+      } catch (e) {
+        this.missingSounds.push(name);
+        this.lastError = `${name}: ${message(e)}`;
+      }
+    }
+
+    if (!this.loops.engine_low && !this.loops.idle) {
       this.status = 'unavailable';
     } else {
       this.status = this.missingSounds.length > 0 ? 'partial' : 'ready';
@@ -88,9 +123,9 @@ class EngineAudioController {
     await this.init();
     if (this.status === 'unavailable') return this.getInfo();
     try {
-      this.players.idle?.play();
-      this.players.engine_loop?.play();
+      for (const ch of Object.values(this.loops)) ch?.player.play();
       this.running = true;
+      this.startSmoother();
     } catch (e) {
       this.lastError = `start: ${message(e)}`;
       this.status = 'error';
@@ -100,47 +135,56 @@ class EngineAudioController {
 
   stop(): AudioInfo {
     this.running = false;
-    for (const player of Object.values(this.players)) {
+    if (this.smoother) {
+      clearInterval(this.smoother);
+      this.smoother = null;
+    }
+    for (const ch of Object.values(this.loops)) {
       try {
-        player?.pause();
+        ch?.player.pause();
       } catch {
-        // ignore — stopping must never throw
+        // stopping must never throw
       }
     }
     return this.getInfo();
   }
 
-  /** Apply the latest simulated engine state to the audio layer. */
+  /**
+   * Receive the latest simulated engine state. Only sets *targets* — the
+   * smoothing loop applies them gradually so nothing jumps audibly.
+   */
   update(state: EngineState): void {
     if (!this.running) return;
 
-    // Crossfade idle <-> engine loop by speed so standstill sounds lumpy and
-    // low instead of like a pitched-down highway pull.
-    const blend = Math.min(1, Math.max(0, state.speedMph / CROSSFADE_MAX_MPH));
+    // Idle <-> engine crossfade by speed (equal-power).
+    const engineBlend = Math.min(1, Math.max(0, state.speedMph / CROSSFADE_MAX_MPH));
+    const idleW = Math.cos((engineBlend * Math.PI) / 2);
+    const engineW = Math.sin((engineBlend * Math.PI) / 2);
 
-    const engine = this.players.engine_loop;
-    if (engine) {
-      try {
-        engine.volume = clamp01(state.engineVolume * blend);
-        engine.setPlaybackRate(clampRate(state.enginePitch));
-      } catch (e) {
-        this.lastError = `engine loop: ${message(e)}`;
-      }
+    // Low <-> high layer crossfade by RPM (equal-power).
+    const layerBlend = Math.min(
+      1,
+      Math.max(0, (state.virtualRPM - LAYER_FADE_START) / (LAYER_FADE_END - LAYER_FADE_START))
+    );
+    const lowW = Math.cos((layerBlend * Math.PI) / 2);
+    const highW = Math.sin((layerBlend * Math.PI) / 2);
+
+    if (this.loops.idle) {
+      this.loops.idle.targetVolume = clamp01(state.engineVolume * idleW);
+      this.loops.idle.targetRate = 1;
     }
-
-    const idle = this.players.idle;
-    if (idle) {
-      try {
-        idle.volume = clamp01(state.engineVolume * (1 - blend));
-      } catch (e) {
-        this.lastError = `idle loop: ${message(e)}`;
-      }
+    if (this.loops.engine_low) {
+      this.loops.engine_low.targetVolume = clamp01(state.engineVolume * engineW * lowW);
+      this.loops.engine_low.targetRate = clampRate(state.virtualRPM / LOW_LAYER_RPM);
+    }
+    if (this.loops.engine_high) {
+      this.loops.engine_high.targetVolume = clamp01(state.engineVolume * engineW * highW);
+      this.loops.engine_high.targetRate = clampRate(state.virtualRPM / HIGH_LAYER_RPM);
     }
 
     if (state.shouldTriggerShift) {
       this.playOneShot('shift', 0.8);
     }
-
     if (state.isDecelerating && state.speedMph > 5) {
       const now = Date.now();
       if (now - this.lastDecelAt > DECEL_COOLDOWN_MS) {
@@ -150,8 +194,33 @@ class EngineAudioController {
     }
   }
 
-  private playOneShot(name: SoundName, volume: number): void {
-    const player = this.players[name];
+  /** 15 Hz easing loop: move actual volume/rate toward targets in small steps. */
+  private startSmoother(): void {
+    if (this.smoother) return;
+    this.smoother = setInterval(() => {
+      if (!this.running) return;
+      for (const ch of Object.values(this.loops)) {
+        if (!ch) continue;
+        try {
+          const dv = ch.targetVolume - ch.volume;
+          if (Math.abs(dv) > 0.005) {
+            ch.volume += dv * VOLUME_EASE;
+            ch.player.volume = clamp01(ch.volume);
+          }
+          const dr = ch.targetRate - ch.rate;
+          if (Math.abs(dr) > 0.004) {
+            ch.rate += dr * RATE_EASE;
+            ch.player.setPlaybackRate(clampRate(ch.rate));
+          }
+        } catch (e) {
+          this.lastError = `smoother: ${message(e)}`;
+        }
+      }
+    }, SMOOTH_TICK_MS);
+  }
+
+  private playOneShot(name: 'shift' | 'decel', volume: number): void {
+    const player = this.oneShots[name];
     if (!player) return;
     try {
       player.volume = clamp01(volume);
@@ -165,13 +234,21 @@ class EngineAudioController {
   /** Fully tear down native players (e.g. on app shutdown). */
   release(): void {
     this.stop();
-    for (const name of Object.keys(this.players) as SoundName[]) {
+    for (const key of Object.keys(this.loops) as (keyof typeof this.loops)[]) {
       try {
-        this.players[name]?.release();
+        this.loops[key]?.player.release();
       } catch {
         // ignore
       }
-      delete this.players[name];
+      delete this.loops[key];
+    }
+    for (const key of Object.keys(this.oneShots) as (keyof typeof this.oneShots)[]) {
+      try {
+        this.oneShots[key]?.release();
+      } catch {
+        // ignore
+      }
+      delete this.oneShots[key];
     }
     this.status = 'uninitialized';
   }
@@ -192,3 +269,6 @@ function message(e: unknown): string {
 
 /** App-wide singleton — audio must survive screen/component remounts. */
 export const EngineAudio = new EngineAudioController();
+
+// Keep SoundName import referenced for the asset registry type.
+export type { SoundName };
